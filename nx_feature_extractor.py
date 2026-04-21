@@ -299,6 +299,10 @@ def extract_to_json(output_dir=None):
     session = get_session()
     workPart = session.Parts.Work
 
+    # Teamcenter 환경에서 Work Part가 None인 경우 Display Part 사용
+    if workPart is None:
+        workPart = session.Parts.Display
+
     if workPart is None:
         print("열린 Part가 없습니다.")
         return None
@@ -308,12 +312,15 @@ def extract_to_json(output_dir=None):
     # 추출 실행
     data = extract_part_sequence(workPart)
 
-    # 저장 경로
+    # 저장 경로 (슬래시 정규화 - 한글/특수문자 경로 오류 방지)
     if output_dir is None:
         output_dir = os.path.dirname(workPart.FullPath)
 
+    output_dir = output_dir.replace("\\", "/")
+    os.makedirs(output_dir, exist_ok=True)
+
     part_name = workPart.Name.replace(".prt", "")
-    output_path = os.path.join(output_dir, f"{part_name}_sequence.json")
+    output_path = output_dir + "/" + part_name + "_sequence.json"
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -393,10 +400,10 @@ def batch_extract(prt_dir, output_dir):
 if __name__ == "__main__":
 
     # 단일 Part 추출 (현재 열린 Part)
-    extract_to_json(output_dir="C:/nx_rag_corpus")
+    extract_to_json(output_dir="D:/work/26 AI TF/01-2 설계 자동화")
 
     # 배치 추출 (폴더 전체)
     # batch_extract(
     #     prt_dir="C:/teamcenter_checkout",
-    #     output_dir="C:/nx_rag_corpus"
+    #     output_dir="D:/work/26 AI TF/01-2 설계 자동화"
     # )
