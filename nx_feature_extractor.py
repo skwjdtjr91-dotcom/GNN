@@ -319,7 +319,9 @@ def extract_to_json(output_dir=None):
     output_dir = output_dir.replace("\\", "/")
     os.makedirs(output_dir, exist_ok=True)
 
+    # Part 이름 정제 (Teamcenter 파트번호에 / 포함될 수 있음)
     part_name = workPart.Name.replace(".prt", "")
+    part_name = part_name.replace("/", "_").replace("\\", "_").replace(":", "_")
     output_path = output_dir + "/" + part_name + "_sequence.json"
 
     with open(output_path, "w", encoding="utf-8") as f:
