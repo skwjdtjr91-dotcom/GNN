@@ -85,20 +85,79 @@ def dump_sketch_object(sk):
     data = {
         "name":       str(getattr(sk, "Name", "")),
         "journal_id": str(getattr(sk, "JournalIdentifier", "")),
+        "plane":      "",
+        "origin":     [],
+        "normal":     [],
+        "x_axis":     [],
+        "datum_ref":  "",
         "entities":   [],
         "dimensions": []
     }
+
+    # 스케치 원점
+    try:
+        data["origin"] = pt3(sk.Origin)
+    except:
+        pass
+
+    # 스케치 X축 방향
+    try:
+        x = sk.ReferenceDirection
+        data["x_axis"] = [round(x.X, 4), round(x.Y, 4), round(x.Z, 4)]
+    except:
+        pass
+
+    # 법선 방향 (HelpPoint 기반)
+    try:
+        hp = sk.HelpPoint
+        ox = data["origin"]
+        if ox and hp:
+            dx = hp.X - ox[0]
+            dy = hp.Y - ox[1]
+            dz = hp.Z - ox[2]
+            length = (dx**2 + dy**2 + dz**2) ** 0.5
+            if length > 0.001:
+                data["normal"] = [round(dx/length, 4),
+                                  round(dy/length, 4),
+                                  round(dz/length, 4)]
+    except:
+        pass
+
+    # 평면 이름 추론
+    try:
+        n = data["normal"]
+        if n:
+            if abs(n[2]) > 0.9:
+                data["plane"] = "XY"
+            elif abs(n[1]) > 0.9:
+                data["plane"] = "XZ"
+            elif abs(n[0]) > 0.9:
+                data["plane"] = "YZ"
+            else:
+                data["plane"] = "custom"
+    except:
+        pass
+
+    # 연결된 Datum CSYS 참조
+    try:
+        ref = sk.ReferenceCoordinateSystem
+        if ref:
+            data["datum_ref"] = str(getattr(ref, "Name", "")) or \
+                                 str(getattr(ref, "JournalIdentifier", ""))
+    except:
+        pass
+
+    # 커브
     try:
         for g in sk.GetAllGeometry():
             data["entities"].append(dump_curve(g))
     except:
         pass
+
+    # 치수
     try:
         for d in sk.GetDimensions():
-            dim = {
-                "name":  str(getattr(d, "Name", "")),
-                "value": None
-            }
+            dim = {"name": str(getattr(d, "Name", "")), "value": None}
             try:
                 dim["value"] = sf(d.ComputedSize)
             except:
@@ -106,6 +165,7 @@ def dump_sketch_object(sk):
             data["dimensions"].append(dim)
     except:
         pass
+
     return data
 
 
@@ -165,11 +225,13 @@ def build_sequence(work_part):
 
     # 5. 시퀀스 생성
     seq = []
-    skip_types = ["DATUM_PLANE", "DATUM_AXIS", "DATUM_CSYS", "COORDINATE_SYSTEM"]
+    # Datum은 스킵하지 않고 참조 정보로 포함
+    skip_types = []  # 아무것도 스킵 안 함 (Datum도 포함)
+    datum_skip = ["DATUM_AXIS"]  # 축만 스킵
 
     for i, feat in enumerate(features, 1):
         raw_type = feat.FeatureType
-        if any(s in raw_type.upper() for s in skip_types):
+        if any(s in raw_type.upper() for s in datum_skip):
             continue
 
         cmd = normalize_type(feat)
@@ -186,12 +248,45 @@ def build_sequence(work_part):
             "entities":     get_feature_entities(feat)
         }
 
+        # Datum Plane
+        if "DATUM_PLANE" in raw_type.upper():
+            try:
+                dp = NXOpen.DatumPlane(feat.Tag)
+                item["command"] = "DatumPlane"
+                item["detail"] = {
+                    "origin": pt3(dp.Origin),
+                    "normal": [round(dp.Normal.X, 4),
+                               round(dp.Normal.Y, 4),
+                               round(dp.Normal.Z, 4)]
+                }
+            except:
+                item["command"] = "DatumPlane"
+
+        # Datum CSYS
+        elif "DATUM_CSYS" in raw_type.upper() or "COORDINATE_SYSTEM" in raw_type.upper():
+            try:
+                item["command"] = "DatumCSYS"
+                params = {}
+                for exp in feat.GetExpressions():
+                    try:
+                        params[exp.Name] = sf(exp.Value)
+                    except:
+                        pass
+                item["detail"] = {"parameters": params}
+            except:
+                item["command"] = "DatumCSYS"
+
         # Sketch: sketch 객체 정보 추가
-        if "SKETCH" in raw_type.upper():
+        elif "SKETCH" in raw_type.upper():
             sk_data = sketch_map.get(i - 1)
             if sk_data:
                 item["sketch_name"]       = sk_data["name"]
                 item["sketch_journal_id"] = sk_data["journal_id"]
+                item["plane"]             = sk_data["plane"]
+                item["origin"]            = sk_data["origin"]
+                item["normal"]            = sk_data["normal"]
+                item["x_axis"]            = sk_data["x_axis"]
+                item["datum_ref"]         = sk_data["datum_ref"]
                 item["entities"]          = sk_data["entities"]
                 item["dimensions"]        = sk_data["dimensions"]
             else:
