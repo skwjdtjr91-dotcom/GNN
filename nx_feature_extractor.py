@@ -1,19 +1,10 @@
 """
-NX Open Python - Feature Sequence Extractor (상세 버전)
-NX Part에서 명령어 시퀀스를 추출해서 RAG corpus용 JSON으로 저장
-
-추출 정보:
-- Sketch: 평면, 원점, 포함된 커브(Line/Arc/Circle) 좌표 및 파라미터
-- Extrude: 참조 스케치, 방향, 거리(+/-), Boolean 타입
-- Fillet: 반지름, 적용된 edge 위치/타입
-- Chamfer: 거리, 적용된 edge 위치
-- Shell: 두께, 열린 face 위치/법선
-- Revolve: 참조 스케치, 회전 각도, Boolean 타입
+NX Open Python - Feature Sequence Extractor
+work_part.Sketches 방식으로 스케치 커브 정확히 추출
 """
 
 import NXOpen
 import NXOpen.Features
-import NXOpen.UF
 import json
 import os
 from datetime import datetime
@@ -23,128 +14,229 @@ def get_session():
     return NXOpen.Session.GetSession()
 
 
-# ─────────────────────────────────────────
-# Sketch 상세 추출
-# ─────────────────────────────────────────
+# ─── 헬퍼 ───────────────────────────────
 
-def get_sketch_curves(sketch):
-    """스케치 안의 커브(Line/Arc/Circle) 추출"""
-    curves = []
+def pt3(point):
     try:
-        for curve in sketch.GetAllGeometry():
-            curve_info = {}
-            curve_type = type(curve).__name__
+        return [round(point.X, 4), round(point.Y, 4), round(point.Z, 4)]
+    except:
+        return []
 
-            if "Line" in curve_type:
-                curve_info["type"] = "Line"
-                try:
-                    curve_info["start"] = [round(curve.StartPoint.X, 4),
-                                           round(curve.StartPoint.Y, 4),
-                                           round(curve.StartPoint.Z, 4)]
-                    curve_info["end"]   = [round(curve.EndPoint.X, 4),
-                                           round(curve.EndPoint.Y, 4),
-                                           round(curve.EndPoint.Z, 4)]
-                except:
-                    pass
+def sf(value):
+    try:
+        return round(float(value), 4)
+    except:
+        return None
 
-            elif "Arc" in curve_type:
-                curve_info["type"] = "Arc"
-                try:
-                    curve_info["center"]      = [round(curve.CenterPoint.X, 4),
-                                                 round(curve.CenterPoint.Y, 4),
-                                                 round(curve.CenterPoint.Z, 4)]
-                    curve_info["radius"]      = round(curve.Radius, 4)
-                    curve_info["start_angle"] = round(curve.StartAngle, 4)
-                    curve_info["end_angle"]   = round(curve.EndAngle, 4)
-                except:
-                    pass
+def feature_timestamp(feature):
+    try:
+        return feature.Timestamp
+    except:
+        return 999999
 
-            elif "Circle" in curve_type:
-                curve_info["type"] = "Circle"
-                try:
-                    curve_info["center"] = [round(curve.CenterPoint.X, 4),
-                                            round(curve.CenterPoint.Y, 4),
-                                            round(curve.CenterPoint.Z, 4)]
-                    curve_info["radius"] = round(curve.Radius, 4)
-                except:
-                    pass
+def normalize_type(feature):
+    type_map = {
+        "SWP104": "Sweep", "SWP105": "Sweep",
+        "BLND": "Fillet", "CHMFR": "Chamfer",
+        "BOSS": "Boss", "POCKET": "Pocket",
+        "HOLE": "Hole", "THD": "Thread",
+        "MIRR": "Mirror", "PTRN": "Pattern",
+    }
+    raw = getattr(feature, "FeatureType", "")
+    return type_map.get(raw.upper(), raw)
 
-            else:
-                curve_info["type"] = curve_type
 
-            if curve_info:
-                curves.append(curve_info)
+# ─── 커브 추출 ───────────────────────────
+
+def dump_curve(g):
+    item = {"type": "curve"}
+    # Line
+    try:
+        item["type"]  = "line"
+        item["start"] = pt3(g.StartPoint)
+        item["end"]   = pt3(g.EndPoint)
+        return item
     except:
         pass
-    return curves
+    # Arc / Circle
+    try:
+        item["center"] = pt3(g.CenterPoint)
+        item["radius"] = sf(g.Radius)
+        try:
+            item["start"] = pt3(g.StartPoint)
+            item["end"]   = pt3(g.EndPoint)
+            item["type"]  = "arc"
+        except:
+            item["type"] = "circle"
+        return item
+    except:
+        pass
+    # 길이
+    try:
+        item["length"] = sf(g.GetLength())
+    except:
+        pass
+    return item
 
 
-def get_sketch_detail(feature):
-    """Sketch Feature 상세 정보 (NX 2406 호환)"""
-    detail = {
-        "plane": "",
-        "origin": [],
-        "normal": [],
-        "curves": [],
-        "curve_count": 0
+# ─── 스케치 객체 덤프 ────────────────────
+
+def dump_sketch_object(sk):
+    data = {
+        "name":       str(getattr(sk, "Name", "")),
+        "journal_id": str(getattr(sk, "JournalIdentifier", "")),
+        "entities":   [],
+        "dimensions": []
     }
     try:
-        # NX 2406: SketchFeature로 캐스팅 후 Sketch 객체 획득
-        sketch_feature = NXOpen.Features.SketchFeature(feature.Tag)
-        sketch = sketch_feature.Sketch
-
-        try:
-            origin = sketch.Origin
-            detail["origin"] = [round(origin.X, 4),
-                                 round(origin.Y, 4),
-                                 round(origin.Z, 4)]
-        except:
-            pass
-
-        try:
-            normal = sketch.ReferenceDirection
-            nx_val = round(normal.X, 4)
-            ny_val = round(normal.Y, 4)
-            nz_val = round(normal.Z, 4)
-            detail["normal"] = [nx_val, ny_val, nz_val]
-
-            if abs(nz_val) > 0.9:
-                detail["plane"] = "XY"
-            elif abs(ny_val) > 0.9:
-                detail["plane"] = "XZ"
-            elif abs(nx_val) > 0.9:
-                detail["plane"] = "YZ"
-            else:
-                detail["plane"] = "custom({},{},{})".format(nx_val, ny_val, nz_val)
-        except:
-            pass
-
-        curves = get_sketch_curves(sketch)
-        detail["curves"] = curves
-        detail["curve_count"] = len(curves)
-
+        for g in sk.GetAllGeometry():
+            data["entities"].append(dump_curve(g))
     except:
-        # SketchFeature 캐스팅 실패 시 파라미터로 폴백
-        try:
+        pass
+    try:
+        for d in sk.GetDimensions():
+            dim = {
+                "name":  str(getattr(d, "Name", "")),
+                "value": None
+            }
+            try:
+                dim["value"] = sf(d.ComputedSize)
+            except:
+                pass
+            data["dimensions"].append(dim)
+    except:
+        pass
+    return data
+
+
+# ─── Feature entities 추출 ───────────────
+
+def get_feature_entities(feature):
+    out = []
+    try:
+        for e in feature.GetEntities():
+            item = {"class": str(type(e))}
+            try:
+                item["name"] = str(e.Name)
+            except:
+                pass
+            try:
+                item["journal_id"] = str(e.JournalIdentifier)
+            except:
+                pass
+            try:
+                item["point"] = pt3(e.Coordinates)
+            except:
+                pass
+            out.append(item)
+    except:
+        pass
+    return out
+
+
+# ─── 시퀀스 빌드 ─────────────────────────
+
+def build_sequence(work_part):
+    # 1. Feature 목록 (타임스탬프 정렬)
+    features = []
+    for feat in work_part.Features:
+        features.append(feat)
+    features = sorted(features, key=lambda f: feature_timestamp(f))
+
+    # 2. 실제 Sketch 객체 목록
+    sketch_objects = []
+    try:
+        for sk in work_part.Sketches:
+            sketch_objects.append(sk)
+    except:
+        pass
+
+    # 3. Sketch feature 인덱스 수집
+    sketch_feature_indices = []
+    for i, feat in enumerate(features):
+        if normalize_type(feat) == "SKETCH" or "SKETCH" in feat.FeatureType.upper():
+            sketch_feature_indices.append(i)
+
+    # 4. sketch feature ↔ sketch 객체 매핑
+    sketch_map = {}
+    for idx, feat_index in enumerate(sketch_feature_indices):
+        if idx < len(sketch_objects):
+            sketch_map[feat_index] = dump_sketch_object(sketch_objects[idx])
+
+    # 5. 시퀀스 생성
+    seq = []
+    skip_types = ["DATUM_PLANE", "DATUM_AXIS", "DATUM_CSYS", "COORDINATE_SYSTEM"]
+
+    for i, feat in enumerate(features, 1):
+        raw_type = feat.FeatureType
+        if any(s in raw_type.upper() for s in skip_types):
+            continue
+
+        cmd = normalize_type(feat)
+        feat_name = str(getattr(feat, "Name", ""))
+        if not feat_name:
+            feat_name = "{}({})".format(cmd, feat.Tag)
+
+        item = {
+            "step":         i,
+            "command":      cmd,
+            "name":         feat_name,
+            "feature_type": raw_type,
+            "journal_id":   str(getattr(feat, "JournalIdentifier", "")),
+            "entities":     get_feature_entities(feat)
+        }
+
+        # Sketch: sketch 객체 정보 추가
+        if "SKETCH" in raw_type.upper():
+            sk_data = sketch_map.get(i - 1)
+            if sk_data:
+                item["sketch_name"]       = sk_data["name"]
+                item["sketch_journal_id"] = sk_data["journal_id"]
+                item["entities"]          = sk_data["entities"]
+                item["dimensions"]        = sk_data["dimensions"]
+            else:
+                item["dimensions"] = []
+
+        # Extrude
+        elif "EXTRUDE" in raw_type.upper() or "EXTRUDED" in raw_type.upper():
+            item["detail"] = get_extrude_detail(feat)
+
+        # Fillet
+        elif any(k in raw_type.upper() for k in ["FILLET", "EDGE_BLEND", "BLEND", "BLND"]):
+            item["detail"] = get_fillet_detail(feat)
+
+        # Chamfer
+        elif any(k in raw_type.upper() for k in ["CHAMFER", "CHMFR"]):
+            item["detail"] = get_chamfer_detail(feat)
+
+        # Shell
+        elif "SHELL" in raw_type.upper():
+            item["detail"] = get_shell_detail(feat)
+
+        # Revolve
+        elif "REVOLVE" in raw_type.upper():
+            item["detail"] = get_revolve_detail(feat)
+
+        else:
             params = {}
-            for exp in feature.GetExpressions():
-                try:
-                    params[exp.Name] = round(exp.Value, 4)
-                except:
-                    pass
-            detail["parameters"] = params
-        except:
-            pass
+            try:
+                for exp in feat.GetExpressions():
+                    try:
+                        params[exp.Name] = sf(exp.Value)
+                    except:
+                        pass
+            except:
+                pass
+            item["detail"] = {"parameters": params}
 
-    return detail
+        seq.append(item)
+
+    return seq
 
 
-# ─────────────────────────────────────────
-# Extrude 상세 추출
-# ─────────────────────────────────────────
+# ─── Feature 상세 ────────────────────────
 
 def get_extrude_detail(feature):
-    """Extrude Feature 상세 정보"""
     detail = {
         "referenced_sketch": "",
         "distance_positive": None,
@@ -153,108 +245,70 @@ def get_extrude_detail(feature):
         "taper_angle": None
     }
     try:
-        exprs = feature.GetExpressions()
-        for exp in exprs:
+        for exp in feature.GetExpressions():
             n = exp.Name.lower()
             v = exp.Value
             if "end" in n or "depth" in n or "distance" in n:
                 if "start" in n or "negative" in n or "opposite" in n:
-                    detail["distance_negative"] = round(v, 4)
+                    detail["distance_negative"] = sf(v)
                 else:
-                    detail["distance_positive"] = round(v, 4)
+                    detail["distance_positive"] = sf(v)
             elif "taper" in n or "draft" in n:
-                detail["taper_angle"] = round(v, 4)
+                detail["taper_angle"] = sf(v)
             elif "boolean" in n or "operation" in n:
-                val = int(v)
                 mapping = {0: "NewBody", 1: "Unite", 2: "Subtract", 3: "Intersect"}
-                detail["boolean_type"] = mapping.get(val, str(val))
+                detail["boolean_type"] = mapping.get(int(v), str(v))
     except:
         pass
-
     try:
-        parents = feature.GetParents()
-        for p in parents:
+        for p in feature.GetParents():
             if "SKETCH" in p.FeatureType.upper():
                 detail["referenced_sketch"] = p.Name
                 break
     except:
         pass
-
     return detail
 
 
-# ─────────────────────────────────────────
-# Edge / Face 기하학 정보
-# ─────────────────────────────────────────
-
-def get_edge_detail(entity):
-    """Edge 기하학 정보"""
+def get_edge_info(entity):
     info = {}
     try:
         bbox = entity.GetBoundingBox()
-        min_z = round(bbox.MinXYZ.Z, 4)
-        max_z = round(bbox.MaxXYZ.Z, 4)
-        cx = round((bbox.MinXYZ.X + bbox.MaxXYZ.X) / 2, 4)
-        cy = round((bbox.MinXYZ.Y + bbox.MaxXYZ.Y) / 2, 4)
-        cz = round((min_z + max_z) / 2, 4)
-
-        info["center"] = [cx, cy, cz]
-        info["bbox_min"] = [round(bbox.MinXYZ.X, 4), round(bbox.MinXYZ.Y, 4), min_z]
-        info["bbox_max"] = [round(bbox.MaxXYZ.X, 4), round(bbox.MaxXYZ.Y, 4), max_z]
-        info["z_position"] = cz
-
-        dz = abs(max_z - min_z)
-        dx = abs(bbox.MaxXYZ.X - bbox.MinXYZ.X)
-        dy = abs(bbox.MaxXYZ.Y - bbox.MinXYZ.Y)
-
-        if dz < 0.001:
-            info["edge_orientation"] = "horizontal"
-        else:
-            info["edge_orientation"] = "vertical"
-
-    except Exception as e:
-        info["error"] = str(e)
-    return info
-
-
-def get_face_detail(entity):
-    """Face 기하학 정보"""
-    info = {}
-    try:
-        bbox = entity.GetBoundingBox()
-        cx = round((bbox.MinXYZ.X + bbox.MaxXYZ.X) / 2, 4)
-        cy = round((bbox.MinXYZ.Y + bbox.MaxXYZ.Y) / 2, 4)
-        cz = round((bbox.MinXYZ.Z + bbox.MaxXYZ.Z) / 2, 4)
-
-        info["center"] = [cx, cy, cz]
-        info["z_position"] = cz
-        info["size"] = [
-            round(abs(bbox.MaxXYZ.X - bbox.MinXYZ.X), 4),
-            round(abs(bbox.MaxXYZ.Y - bbox.MinXYZ.Y), 4),
-            round(abs(bbox.MaxXYZ.Z - bbox.MinXYZ.Z), 4)
+        info["center"] = [
+            round((bbox.MinXYZ.X + bbox.MaxXYZ.X) / 2, 4),
+            round((bbox.MinXYZ.Y + bbox.MaxXYZ.Y) / 2, 4),
+            round((bbox.MinXYZ.Z + bbox.MaxXYZ.Z) / 2, 4)
         ]
-        dz = info["size"][2]
-        info["face_orientation"] = "horizontal" if dz < 0.001 else "vertical"
-
-    except Exception as e:
-        info["error"] = str(e)
+        info["z_position"] = info["center"][2]
+    except:
+        pass
     return info
 
 
-# ─────────────────────────────────────────
-# Fillet / Chamfer / Shell / Revolve
-# ─────────────────────────────────────────
+def get_face_info(entity):
+    info = {}
+    try:
+        bbox = entity.GetBoundingBox()
+        info["center"] = [
+            round((bbox.MinXYZ.X + bbox.MaxXYZ.X) / 2, 4),
+            round((bbox.MinXYZ.Y + bbox.MaxXYZ.Y) / 2, 4),
+            round((bbox.MinXYZ.Z + bbox.MaxXYZ.Z) / 2, 4)
+        ]
+    except:
+        pass
+    return info
+
 
 def get_fillet_detail(feature):
     detail = {"radius": None, "applied_edges": []}
     try:
         for exp in feature.GetExpressions():
             if "radius" in exp.Name.lower():
-                detail["radius"] = round(exp.Value, 4)
+                detail["radius"] = sf(exp.Value)
                 break
-        for entity in feature.GetEntities():
+        for e in feature.GetEntities():
             try:
-                detail["applied_edges"].append(get_edge_detail(entity))
+                detail["applied_edges"].append(get_edge_info(e))
             except:
                 pass
     except:
@@ -268,12 +322,12 @@ def get_chamfer_detail(feature):
         for exp in feature.GetExpressions():
             n = exp.Name.lower()
             if "distance" in n or "offset" in n:
-                detail["distance"] = round(exp.Value, 4)
+                detail["distance"] = sf(exp.Value)
             elif "angle" in n:
-                detail["angle"] = round(exp.Value, 4)
-        for entity in feature.GetEntities():
+                detail["angle"] = sf(exp.Value)
+        for e in feature.GetEntities():
             try:
-                detail["applied_edges"].append(get_edge_detail(entity))
+                detail["applied_edges"].append(get_edge_info(e))
             except:
                 pass
     except:
@@ -286,11 +340,11 @@ def get_shell_detail(feature):
     try:
         for exp in feature.GetExpressions():
             if "thickness" in exp.Name.lower():
-                detail["thickness"] = round(exp.Value, 4)
+                detail["thickness"] = sf(exp.Value)
                 break
-        for entity in feature.GetEntities():
+        for e in feature.GetEntities():
             try:
-                detail["open_faces"].append(get_face_detail(entity))
+                detail["open_faces"].append(get_face_info(e))
             except:
                 pass
     except:
@@ -304,11 +358,10 @@ def get_revolve_detail(feature):
         for exp in feature.GetExpressions():
             n = exp.Name.lower()
             if "angle" in n:
-                detail["angle"] = round(exp.Value, 4)
+                detail["angle"] = sf(exp.Value)
             elif "boolean" in n or "operation" in n:
-                val = int(exp.Value)
                 mapping = {0: "NewBody", 1: "Unite", 2: "Subtract", 3: "Intersect"}
-                detail["boolean_type"] = mapping.get(val, str(val))
+                detail["boolean_type"] = mapping.get(int(exp.Value), str(exp.Value))
         for p in feature.GetParents():
             if "SKETCH" in p.FeatureType.upper():
                 detail["referenced_sketch"] = p.Name
@@ -318,123 +371,7 @@ def get_revolve_detail(feature):
     return detail
 
 
-# ─────────────────────────────────────────
-# 메인 Feature 정보 추출
-# ─────────────────────────────────────────
-
-def get_feature_info(feature):
-    """Feature 하나에서 전체 정보 추출"""
-
-    # NX 내부 타입 코드 → 사람이 읽기 쉬운 이름 매핑
-    type_map = {
-        "SWP104": "SWEEP",
-        "SWP105": "SWEEP",
-        "BLND":   "FILLET",
-        "CHMFR":  "CHAMFER",
-        "BOSS":   "BOSS",
-        "POCKET": "POCKET",
-        "HOLE":   "HOLE",
-        "THD":    "THREAD",
-        "MIRR":   "MIRROR",
-        "PTRN":   "PATTERN",
-        "RECT_PAD": "PAD",
-    }
-
-    raw_type = feature.FeatureType
-    display_type = type_map.get(raw_type.upper(), raw_type)
-
-    # Feature 이름: 빈 경우 타입+태그로 대체
-    feat_name = feature.Name
-    if not feat_name:
-        feat_name = "{}({})".format(display_type, feature.Tag)
-
-    info = {
-        "name": feat_name,
-        "type": display_type,
-        "raw_type": raw_type,
-        "suppressed": feature.Suppressed,
-        "detail": {}
-    }
-
-    ft = raw_type.upper()
-
-    try:
-        if "SKETCH" in ft:
-            info["detail"] = get_sketch_detail(feature)
-        elif "EXTRUDE" in ft or "EXTRUDED" in ft:
-            info["detail"] = get_extrude_detail(feature)
-        elif "FILLET" in ft or "EDGE_BLEND" in ft or "BLEND" in ft or "BLND" in ft:
-            info["detail"] = get_fillet_detail(feature)
-        elif "CHAMFER" in ft or "CHMFR" in ft:
-            info["detail"] = get_chamfer_detail(feature)
-        elif "SHELL" in ft:
-            info["detail"] = get_shell_detail(feature)
-        elif "REVOLVE" in ft:
-            info["detail"] = get_revolve_detail(feature)
-        elif "SWP" in ft or "SWEEP" in ft:
-            # Sweep: 파라미터만 추출
-            params = {}
-            try:
-                for exp in feature.GetExpressions():
-                    try:
-                        params[exp.Name] = round(exp.Value, 4)
-                    except:
-                        pass
-            except:
-                pass
-            info["detail"] = {"parameters": params}
-        else:
-            params = {}
-            try:
-                for exp in feature.GetExpressions():
-                    try:
-                        params[exp.Name] = round(exp.Value, 4)
-                    except:
-                        pass
-            except:
-                pass
-            info["detail"] = {"parameters": params}
-
-    except Exception as e:
-        info["detail"]["error"] = str(e)
-
-    return info
-
-
-# ─────────────────────────────────────────
-# Part 전체 시퀀스 추출
-# ─────────────────────────────────────────
-
-def extract_part_sequence(part):
-    result = {
-        "part_name": part.Name,
-        "file_path": part.FullPath,
-        "extracted_at": datetime.now().isoformat(),
-        "feature_count": 0,
-        "sequence": []
-    }
-
-    skip_types = [
-        "DATUM_PLANE", "DATUM_AXIS", "DATUM_CSYS",
-        "COORDINATE_SYSTEM", "SKETCH_FEATURE_SET"
-    ]
-
-    order = 1
-    for feature in part.Features:
-        if any(skip in feature.FeatureType.upper() for skip in skip_types):
-            continue
-        feat_info = get_feature_info(feature)
-        feat_info["order"] = order
-        result["sequence"].append(feat_info)
-        order += 1
-
-    result["feature_count"] = len(result["sequence"])
-    return result
-
-
-# ─────────────────────────────────────────
-# JSON 저장
-# ─────────────────────────────────────────
+# ─── 저장 ────────────────────────────────
 
 def extract_to_json(output_dir=None):
     session = get_session()
@@ -448,7 +385,16 @@ def extract_to_json(output_dir=None):
         return None
 
     print("추출 중: {}".format(workPart.Name))
-    data = extract_part_sequence(workPart)
+
+    sequence = build_sequence(workPart)
+
+    result = {
+        "part_name":    workPart.Name,
+        "file_path":    workPart.FullPath,
+        "extracted_at": datetime.now().isoformat(),
+        "feature_count": len(sequence),
+        "sequence":     sequence
+    }
 
     if output_dir is None:
         output_dir = os.path.dirname(workPart.FullPath)
@@ -461,50 +407,47 @@ def extract_to_json(output_dir=None):
     output_path = output_dir + "/" + part_name + "_sequence.json"
 
     with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(result, f, ensure_ascii=False, indent=2)
 
     print("저장 완료: {}".format(output_path))
-    print("추출된 Feature 수: {}".format(data["feature_count"]))
+    print("Feature 수: {}".format(len(sequence)))
 
+    # 콘솔 요약
     print("\n=== Feature Sequence ===")
-    for feat in data["sequence"]:
-        d = feat.get("detail", {})
-        ft = feat["type"].upper()
-        print("[{}] {} | {}".format(feat["order"], feat["type"], feat["name"]))
-        if "SKETCH" in ft:
-            print("    평면: {} | 커브 수: {}".format(
-                d.get("plane"), d.get("curve_count")))
-        elif "EXTRUDE" in ft:
-            print("    스케치: {} | 거리+: {} | 거리-: {} | Boolean: {}".format(
-                d.get("referenced_sketch"), d.get("distance_positive"),
-                d.get("distance_negative"), d.get("boolean_type")))
-        elif "BLEND" in ft or "FILLET" in ft:
+    for item in sequence:
+        cmd = item["command"]
+        print("[{}] {} | {}".format(item["step"], cmd, item["name"]))
+        if cmd == "SKETCH":
+            print("    커브 수: {}".format(len(item.get("entities", []))))
+        elif "EXTRUDE" in cmd.upper():
+            d = item.get("detail", {})
+            print("    거리+: {} | 거리-: {} | Boolean: {}".format(
+                d.get("distance_positive"),
+                d.get("distance_negative"),
+                d.get("boolean_type")))
+        elif "FILLET" in cmd.upper() or "BLEND" in cmd.upper():
+            d = item.get("detail", {})
             print("    반지름: {} | edge 수: {}".format(
                 d.get("radius"), len(d.get("applied_edges", []))))
-        elif "CHAMFER" in ft:
+        elif "CHAMFER" in cmd.upper():
+            d = item.get("detail", {})
             print("    거리: {} | edge 수: {}".format(
                 d.get("distance"), len(d.get("applied_edges", []))))
-        elif "SHELL" in ft:
-            print("    두께: {} | 열린 face 수: {}".format(
+        elif "SHELL" in cmd.upper():
+            d = item.get("detail", {})
+            print("    두께: {} | face 수: {}".format(
                 d.get("thickness"), len(d.get("open_faces", []))))
-        elif "REVOLVE" in ft:
-            print("    스케치: {} | 각도: {} | Boolean: {}".format(
-                d.get("referenced_sketch"), d.get("angle"), d.get("boolean_type")))
 
     return output_path
 
 
-# ─────────────────────────────────────────
-# 배치 추출
-# ─────────────────────────────────────────
+# ─── 배치 추출 ───────────────────────────
 
 def batch_extract(prt_dir, output_dir):
     session = get_session()
     results = []
-
     prt_files = [f for f in os.listdir(prt_dir) if f.endswith(".prt")]
     print("발견된 .prt 파일: {}개".format(len(prt_files)))
-
     for prt_file in prt_files:
         prt_path = os.path.join(prt_dir, prt_file)
         print("\n처리 중: {}".format(prt_file))
@@ -517,27 +460,21 @@ def batch_extract(prt_dir, output_dir):
         except Exception as e:
             print("오류: {} - {}".format(prt_file, str(e)))
             results.append({"prt_file": prt_file, "status": "error", "error": str(e)})
-
     summary_path = output_dir.replace("\\", "/") + "/extraction_summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
-
-    print("\n=== 배치 추출 완료 ===")
-    print("성공: {}개".format(sum(1 for r in results if r["status"] == "success")))
-    print("실패: {}개".format(sum(1 for r in results if r["status"] == "error")))
+    print("\n성공: {}개 / 실패: {}개".format(
+        sum(1 for r in results if r["status"] == "success"),
+        sum(1 for r in results if r["status"] == "error")))
     return results
 
 
-# ─────────────────────────────────────────
-# 실행
-# ─────────────────────────────────────────
+# ─── 실행 ────────────────────────────────
 
 if __name__ == "__main__":
 
-    # 단일 Part 추출 (현재 열린 Part)
     extract_to_json(output_dir="D:/work/26 AI TF/01-2 설계 자동화")
 
-    # 배치 추출 (폴더 전체)
     # batch_extract(
     #     prt_dir="C:/teamcenter_checkout",
     #     output_dir="D:/work/26 AI TF/01-2 설계 자동화"
