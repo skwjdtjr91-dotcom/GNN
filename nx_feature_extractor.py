@@ -80,7 +80,7 @@ def get_sketch_curves(sketch):
 
 
 def get_sketch_detail(feature):
-    """Sketch Feature 상세 정보"""
+    """Sketch Feature 상세 정보 (NX 2406 호환)"""
     detail = {
         "plane": "",
         "origin": [],
@@ -89,7 +89,9 @@ def get_sketch_detail(feature):
         "curve_count": 0
     }
     try:
-        sketch = NXOpen.Sketch(feature.Tag)
+        # NX 2406: SketchFeature로 캐스팅 후 Sketch 객체 획득
+        sketch_feature = NXOpen.Features.SketchFeature(feature.Tag)
+        sketch = sketch_feature.Sketch
 
         try:
             origin = sketch.Origin
@@ -101,19 +103,19 @@ def get_sketch_detail(feature):
 
         try:
             normal = sketch.ReferenceDirection
-            nx = round(normal.X, 4)
-            ny = round(normal.Y, 4)
-            nz = round(normal.Z, 4)
-            detail["normal"] = [nx, ny, nz]
+            nx_val = round(normal.X, 4)
+            ny_val = round(normal.Y, 4)
+            nz_val = round(normal.Z, 4)
+            detail["normal"] = [nx_val, ny_val, nz_val]
 
-            if abs(nz) > 0.9:
+            if abs(nz_val) > 0.9:
                 detail["plane"] = "XY"
-            elif abs(ny) > 0.9:
+            elif abs(ny_val) > 0.9:
                 detail["plane"] = "XZ"
-            elif abs(nx) > 0.9:
+            elif abs(nx_val) > 0.9:
                 detail["plane"] = "YZ"
             else:
-                detail["plane"] = "custom({},{},{})".format(nx, ny, nz)
+                detail["plane"] = "custom({},{},{})".format(nx_val, ny_val, nz_val)
         except:
             pass
 
@@ -122,7 +124,18 @@ def get_sketch_detail(feature):
         detail["curve_count"] = len(curves)
 
     except:
-        pass
+        # SketchFeature 캐스팅 실패 시 파라미터로 폴백
+        try:
+            params = {}
+            for exp in feature.GetExpressions():
+                try:
+                    params[exp.Name] = round(exp.Value, 4)
+                except:
+                    pass
+            detail["parameters"] = params
+        except:
+            pass
+
     return detail
 
 
@@ -311,28 +324,65 @@ def get_revolve_detail(feature):
 
 def get_feature_info(feature):
     """Feature 하나에서 전체 정보 추출"""
+
+    # NX 내부 타입 코드 → 사람이 읽기 쉬운 이름 매핑
+    type_map = {
+        "SWP104": "SWEEP",
+        "SWP105": "SWEEP",
+        "BLND":   "FILLET",
+        "CHMFR":  "CHAMFER",
+        "BOSS":   "BOSS",
+        "POCKET": "POCKET",
+        "HOLE":   "HOLE",
+        "THD":    "THREAD",
+        "MIRR":   "MIRROR",
+        "PTRN":   "PATTERN",
+        "RECT_PAD": "PAD",
+    }
+
+    raw_type = feature.FeatureType
+    display_type = type_map.get(raw_type.upper(), raw_type)
+
+    # Feature 이름: 빈 경우 타입+태그로 대체
+    feat_name = feature.Name
+    if not feat_name:
+        feat_name = "{}({})".format(display_type, feature.Tag)
+
     info = {
-        "name": feature.Name,
-        "type": feature.FeatureType,
+        "name": feat_name,
+        "type": display_type,
+        "raw_type": raw_type,
         "suppressed": feature.Suppressed,
         "detail": {}
     }
 
-    ft = feature.FeatureType.upper()
+    ft = raw_type.upper()
 
     try:
         if "SKETCH" in ft:
             info["detail"] = get_sketch_detail(feature)
         elif "EXTRUDE" in ft or "EXTRUDED" in ft:
             info["detail"] = get_extrude_detail(feature)
-        elif "FILLET" in ft or "EDGE_BLEND" in ft or "BLEND" in ft:
+        elif "FILLET" in ft or "EDGE_BLEND" in ft or "BLEND" in ft or "BLND" in ft:
             info["detail"] = get_fillet_detail(feature)
-        elif "CHAMFER" in ft:
+        elif "CHAMFER" in ft or "CHMFR" in ft:
             info["detail"] = get_chamfer_detail(feature)
         elif "SHELL" in ft:
             info["detail"] = get_shell_detail(feature)
         elif "REVOLVE" in ft:
             info["detail"] = get_revolve_detail(feature)
+        elif "SWP" in ft or "SWEEP" in ft:
+            # Sweep: 파라미터만 추출
+            params = {}
+            try:
+                for exp in feature.GetExpressions():
+                    try:
+                        params[exp.Name] = round(exp.Value, 4)
+                    except:
+                        pass
+            except:
+                pass
+            info["detail"] = {"parameters": params}
         else:
             params = {}
             try:
